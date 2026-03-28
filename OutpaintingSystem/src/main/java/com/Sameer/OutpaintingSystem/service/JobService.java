@@ -9,10 +9,10 @@ import org.springframework.stereotype.Service;
 public class JobService {
 
     @Autowired
-    private static JobRepo repo;
+    private JobRepo repo;
 
-    public static void saveJob(Job job) {
-        repo.saveJob(job);
+    public void saveJob(Job job) {
+        repo.save(job);
     }
 
     public Job findById(String id) {

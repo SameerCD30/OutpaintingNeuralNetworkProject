@@ -1,53 +1,39 @@
 package com.Sameer.OutpaintingSystem;
 
-import com.Sameer.OutpaintingSystem.Model.Job;
-import com.Sameer.OutpaintingSystem.service.JobService;
+import com.Sameer.OutpaintingSystem.service.ImageService;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.File;
-import java.util.Map;
-import java.util.UUID;
 
+import java.io.IOException;
+import java.util.Map;
+
+@CrossOrigin(origins = "http://localhost:5173")
 @RestController
-@RequestMapping("/api")
+@RequestMapping("/api/image")
 public class Controller {
 
     @Autowired
-    private JobService service;
+    private ImageService imageService;
 
-    @Autowired
-    private RedisTemplate<String, String> redisTemplate;
+    @PostMapping("/outpaint")
+    public ResponseEntity<?> outpaintImage(
+            @RequestParam("file") MultipartFile file,
+            @RequestParam("aspectRatio") String aspectRatio,
+            @RequestParam("mode") String mode
+    ) throws IOException {
 
-    @PostMapping("/upload")
-    public ResponseEntity<?> upload(@RequestParam MultipartFile file) throws Exception {
+        String resultUrl = imageService.processImage(file, aspectRatio);
 
-        String jobId = UUID.randomUUID().toString();
-
-        String baseDir = System.getProperty("user.dir");
-
-        File dir = new File(baseDir + "/uploads/input/");
-        if (!dir.exists()) {
-            dir.mkdirs();
-        }
-
-        String path = baseDir + "/uploads/input/" + jobId + ".png";
-
-        file.transferTo(new File(path));
-
-        Job job = new Job(jobId, path, null, "PENDING");
-        service.saveJob(job);
-
-        redisTemplate.opsForList().rightPush("queue", jobId);
-
-        return ResponseEntity.ok(Map.of("jobId", jobId));
+        return ResponseEntity.ok(Map.of(
+                "resultUrl", resultUrl
+        ));
     }
 
-    @GetMapping("/job/{id}")
-    public Job getJob(@PathVariable String id) {
-        return service.findById(id);
+    @GetMapping("/health")
+    public String health(){
+        return "working fine";
     }
 }

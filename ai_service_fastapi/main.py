@@ -1,16 +1,15 @@
 """
-FastAPI Outpainting Server
-Wraps the Stable Diffusion inpainting pipeline from Outpainting_Pipeline.ipynb
+ExpandAI — FastAPI Outpainting Server
+Based on Outpainting_Pipeline.ipynb
 
 Run:
-    uvicorn main:app --host 0.0.0.0 --port 8000
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 """
 
 import io
 import base64
 import uuid
 import os
-import asyncio
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -24,220 +23,196 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from diffusers import StableDiffusionInpaintPipeline
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-MODEL_ID       = "runwayml/stable-diffusion-inpainting"
-RESULTS_DIR    = Path("results")
+# Config
+MODEL_ID        = "runwayml/stable-diffusion-inpainting"
+RESULTS_DIR     = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")       # set in environment
-FRONTEND_ORIGIN = os.getenv("FRONTEND_URL", "http://localhost:5173")
+GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
+FRONTEND_URL    = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
-# In-memory job store  { job_id: { status, result_url, error } }
+ASPECT_RATIOS = {
+    "1:1":  (1,  1),
+    "4:3":  (4,  3),
+    "16:9": (16, 9),
+    "9:16": (9,  16),
+    "21:9": (21, 9),
+    "3:4":  (3,  4),
+    "3:2":  (3,  2),
+    "2:3":  (2,  3),
+}
+
+# Job store: { job_id: { status, result_url, error } }
 jobs: dict[str, dict] = {}
-
-# Global pipeline (loaded once at startup)
 pipe = None
 
 
-# ─── Lifespan: load model once ───────────────────────────────────────────────
+# Startup: load model 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pipe
     print("⏳ Loading Stable Diffusion inpainting model…")
-    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype  = torch.float16 if device == "cuda" else torch.float32
     pipe = StableDiffusionInpaintPipeline.from_pretrained(MODEL_ID, torch_dtype=dtype)
     pipe = pipe.to(device)
-    pipe.safety_checker = None          # disable for speed (re-enable if needed)
-    print(f"✅ Model loaded on {device}")
+    pipe.safety_checker = None
+    print(f"✅ Model ready on {device.upper()}")
     yield
-    print("Shutting down…")
 
 
-app = FastAPI(title="ExpandAI — Outpainting API", lifespan=lifespan)
+app = FastAPI(title="ExpandAI Outpainting API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN, "http://localhost:5173", "http://localhost:3000"],
+    allow_origins=[FRONTEND_URL, "http://localhost:5173", "http://localhost:3000", "http://localhost:4173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ─── Aspect-ratio → expansion logic ──────────────────────────────────────────
-ASPECT_RATIOS = {
-    "1:1":  (1, 1),
-    "4:3":  (4, 3),
-    "16:9": (16, 9),
-    "9:16": (9, 16),
-    "21:9": (21, 9),
-    "3:4":  (3, 4),
-    "3:2":  (3, 2),
-    "2:3":  (2, 3),
-}
-
+#Canvas helpers 
 def compute_expansion(orig_w: int, orig_h: int, aspect_ratio: str, direction: str):
-    """
-    Given the original dimensions, target aspect ratio, and direction,
-    return (new_w, new_h, offset_x, offset_y) — how to position the
-    original image on the expanded canvas.
-    """
-    if aspect_ratio not in ASPECT_RATIOS:
-        raise ValueError(f"Unknown aspect ratio: {aspect_ratio}")
-
+    """Return (new_w, new_h, offset_x, offset_y)."""
     ar_w, ar_h = ASPECT_RATIOS[aspect_ratio]
-    target_ar = ar_w / ar_h
-    orig_ar   = orig_w / orig_h
+    target_ar  = ar_w / ar_h
 
-    if direction in ("horizontal", "right", "left", "all"):
-        # fix height, expand width
-        new_h = orig_h
-        new_w = max(orig_w, int(round(orig_h * target_ar)))
-    elif direction in ("vertical", "top", "bottom"):
-        # fix width, expand height
+    if direction in ("vertical", "top", "bottom"):
         new_w = orig_w
         new_h = max(orig_h, int(round(orig_w / target_ar)))
-    else:  # "all" fallback
+    else:                                           #horizontal/all/left/right
         new_h = orig_h
         new_w = max(orig_w, int(round(orig_h * target_ar)))
 
-    # Placement of original inside canvas
-    if direction == "right":
-        offset_x, offset_y = 0, 0
-    elif direction == "left":
-        offset_x, offset_y = new_w - orig_w, 0
-    elif direction == "bottom":
-        offset_x, offset_y = 0, 0
-    elif direction == "top":
-        offset_x, offset_y = 0, new_h - orig_h
-    elif direction == "horizontal":
-        offset_x = (new_w - orig_w) // 2
-        offset_y = 0
-    elif direction == "vertical":
-        offset_x = 0
-        offset_y = (new_h - orig_h) // 2
-    else:  # all / center
-        offset_x = (new_w - orig_w) // 2
-        offset_y = (new_h - orig_h) // 2
+    if   direction == "right":      offset_x, offset_y = 0,                0
+    elif direction == "left":       offset_x, offset_y = new_w - orig_w,   0
+    elif direction == "bottom":     offset_x, offset_y = 0,                0
+    elif direction == "top":        offset_x, offset_y = 0,                new_h - orig_h
+    elif direction == "horizontal": offset_x, offset_y = (new_w - orig_w)//2, 0
+    elif direction == "vertical":   offset_x, offset_y = 0, (new_h - orig_h)//2
+    else:                           offset_x, offset_y = (new_w - orig_w)//2, (new_h - orig_h)//2
 
     return new_w, new_h, offset_x, offset_y
 
 
-def build_canvas_and_mask(image: Image.Image, new_w: int, new_h: int, offset_x: int, offset_y: int):
-    """Build expanded canvas (edge-stretched fill) + binary mask."""
+def build_canvas_and_mask(image: Image.Image, new_w, new_h, off_x, off_y):
+    """Edge-stretch fill (from notebook) + binary mask."""
     orig_w, orig_h = image.size
     canvas = Image.new("RGB", (new_w, new_h))
 
-    # ── fill empty regions with stretched edge pixels ──
-    # left strip
-    if offset_x > 0:
-        left_edge = image.crop((0, 0, 1, orig_h)).resize((offset_x, orig_h))
-        canvas.paste(left_edge, (0, offset_y))
-    # right strip
-    right_start = offset_x + orig_w
-    if right_start < new_w:
-        right_edge = image.crop((orig_w - 1, 0, orig_w, orig_h)).resize((new_w - right_start, orig_h))
-        canvas.paste(right_edge, (right_start, offset_y))
-    # top strip
-    if offset_y > 0:
-        top_edge = image.crop((0, 0, orig_w, 1)).resize((orig_w, offset_y))
-        canvas.paste(top_edge, (offset_x, 0))
-    # bottom strip
-    bottom_start = offset_y + orig_h
-    if bottom_start < new_h:
-        bot_edge = image.crop((0, orig_h - 1, orig_w, orig_h)).resize((orig_w, new_h - bottom_start))
-        canvas.paste(bot_edge, (offset_x, bottom_start))
+    # Fill edges with stretched border pixels
+    if off_x > 0:
+        canvas.paste(image.crop((0, 0, 1, orig_h)).resize((off_x, orig_h)), (0, off_y))
+    rx = off_x + orig_w
+    if rx < new_w:
+        canvas.paste(image.crop((orig_w-1, 0, orig_w, orig_h)).resize((new_w-rx, orig_h)), (rx, off_y))
+    if off_y > 0:
+        canvas.paste(image.crop((0, 0, orig_w, 1)).resize((orig_w, off_y)), (off_x, 0))
+    by = off_y + orig_h
+    if by < new_h:
+        canvas.paste(image.crop((0, orig_h-1, orig_w, orig_h)).resize((orig_w, new_h-by)), (off_x, by))
 
-    # paste original
-    canvas.paste(image, (offset_x, offset_y))
+    # Corners (fill with nearest edge pixel)
+    if off_x > 0 and off_y > 0:
+        corner_color = image.getpixel((0, 0))
+        for cx in range(off_x):
+            for cy in range(off_y):
+                canvas.putpixel((cx, cy), corner_color)
+    if rx < new_w and off_y > 0:
+        corner_color = image.getpixel((orig_w-1, 0))
+        for cx in range(rx, new_w):
+            for cy in range(off_y):
+                canvas.putpixel((cx, cy), corner_color)
+    if off_x > 0 and by < new_h:
+        corner_color = image.getpixel((0, orig_h-1))
+        for cx in range(off_x):
+            for cy in range(by, new_h):
+                canvas.putpixel((cx, cy), corner_color)
+    if rx < new_w and by < new_h:
+        corner_color = image.getpixel((orig_w-1, orig_h-1))
+        for cx in range(rx, new_w):
+            for cy in range(by, new_h):
+                canvas.putpixel((cx, cy), corner_color)
 
-    # ── mask: white = region to generate ──
+    # Paste original
+    canvas.paste(image, (off_x, off_y))
+
+    # White mask = region to generate
     mask = np.ones((new_h, new_w), dtype=np.uint8) * 255
-    mask[offset_y:offset_y + orig_h, offset_x:offset_x + orig_w] = 0
-    mask_image = Image.fromarray(mask)
+    mask[off_y:off_y+orig_h, off_x:off_x+orig_w] = 0
 
-    return canvas, mask_image
+    return canvas, Image.fromarray(mask)
 
 
-def get_prompt_from_groq(image: Image.Image, api_key: str) -> tuple[str, str]:
-    """Auto-generate prompts using Groq's vision model (Llama 4 Scout)."""
-    client = groq.Groq(api_key=api_key)
+def get_groq_prompt(image: Image.Image) -> tuple[str, str]:
+    client = groq.Groq(api_key=GROQ_API_KEY)
 
     buf = io.BytesIO()
     image.save(buf, format="JPEG")
-    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    b64 = base64.b64encode(buf.getvalue()).decode()
 
-    response = client.chat.completions.create(
+    resp = client.chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 {"type": "text", "text": (
-                    "Analyze this image carefully. "
-                    "I am doing outpainting — extending the edges using Stable Diffusion inpainting. "
-                    "Generate TWO things:\n"
-                    "1. A detailed photorealistic positive prompt (scene, lighting, colors, style, quality tags like 8k, highly detailed).\n"
+                    "I am doing outpainting — extending image edges with Stable Diffusion inpainting. "
+                    "Analyze the image carefully and generate:\n"
+                    "1. A detailed photorealistic positive prompt (scene, lighting, colors, style, quality tags).\n"
                     "2. A negative prompt listing things to avoid.\n\n"
-                    "Respond ONLY in this exact format (no extra text):\n"
-                    "POSITIVE: <your positive prompt here>\n"
-                    "NEGATIVE: <your negative prompt here>"
+                    "Respond ONLY in this exact format:\n"
+                    "POSITIVE: <positive prompt>\n"
+                    "NEGATIVE: <negative prompt>"
                 )}
             ]
         }],
-        max_tokens=512
+        max_tokens=512,
     )
 
-    lines = response.choices[0].message.content.strip().splitlines()
     positive, negative = "", ""
-    for line in lines:
-        if line.startswith("POSITIVE:"):
-            positive = line.replace("POSITIVE:", "").strip()
-        elif line.startswith("NEGATIVE:"):
-            negative = line.replace("NEGATIVE:", "").strip()
+    for line in resp.choices[0].message.content.strip().splitlines():
+        if line.startswith("POSITIVE:"): positive = line.replace("POSITIVE:", "").strip()
+        if line.startswith("NEGATIVE:"): negative = line.replace("NEGATIVE:", "").strip()
 
-    if not positive:
-        positive = "photorealistic scene, highly detailed, 8k, natural lighting"
-    if not negative:
-        negative = "blurry, low quality, distorted, watermark, text, bad anatomy, ugly, duplicate"
-
-    return positive, negative
+    return (
+        positive or "photorealistic scene, highly detailed, 8k, natural lighting, sharp focus",
+        negative or "blurry, low quality, distorted, watermark, text, bad anatomy, ugly",
+    )
 
 
+# ── Core outpainting ──────────────────────────────────────────────────────────
 def run_outpainting(
     image: Image.Image,
     aspect_ratio: str,
     direction: str,
     prompt: Optional[str],
     negative_prompt: Optional[str],
-) -> Image.Image:
-    """Core outpainting logic — mirrors your notebook pipeline."""
+) -> tuple[Image.Image, dict]:
+
     orig_w, orig_h = image.size
-
-    # 1. Compute expansion
     new_w, new_h, off_x, off_y = compute_expansion(orig_w, orig_h, aspect_ratio, direction)
+    canvas, mask = build_canvas_and_mask(image, new_w, new_h, off_x, off_y)
 
-    # 2. Build canvas + mask
-    canvas, mask_img = build_canvas_and_mask(image, new_w, new_h, off_x, off_y)
-
-    # 3. Auto-generate prompts via Groq if not provided
-    if not prompt and GROQ_API_KEY:
-        try:
-            prompt, negative_prompt = get_prompt_from_groq(image, GROQ_API_KEY)
-            print(f"  Groq prompt: {prompt[:80]}…")
-        except Exception as e:
-            print(f"  Groq failed ({e}), using fallback prompt")
+    # Auto-generate prompt via Groq if not provided
+    if not prompt:
+        if GROQ_API_KEY:
+            try:
+                prompt, negative_prompt = get_groq_prompt(image)
+                print(f"  Groq → {prompt[:80]}…")
+            except Exception as e:
+                print(f"  Groq failed ({e}), using fallback")
+                prompt = "photorealistic scene, highly detailed, 8k, natural lighting"
+                negative_prompt = "blurry, low quality, distorted, watermark, text"
+        else:
             prompt = "photorealistic scene, highly detailed, 8k, natural lighting"
-            negative_prompt = "blurry, low quality, distorted, watermark, text, bad anatomy"
-    elif not prompt:
-        prompt = "photorealistic scene, highly detailed, 8k, natural lighting"
-        negative_prompt = negative_prompt or "blurry, low quality, distorted, watermark, text"
+            negative_prompt = negative_prompt or "blurry, low quality, distorted, watermark, text"
 
-    # 4. Resize to 512×512 (SD v1.5 requirement)
+    # Resize to 512×512 (SD v1.5 requirement)
     canvas_512 = canvas.resize((512, 512))
-    mask_512   = mask_img.resize((512, 512), Image.NEAREST)
+    mask_512   = mask.resize((512, 512), Image.NEAREST)
 
-    # 5. Run inpainting
     result_512 = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -248,36 +223,43 @@ def run_outpainting(
         strength=0.99,
     ).images[0]
 
-    # 6. Scale result back to target canvas size
+    # Scale back to actual target size
     result = result_512.resize((new_w, new_h), Image.LANCZOS)
-    return result
+
+    meta = {
+        "original_size": [orig_w, orig_h],
+        "result_size":   [new_w, new_h],
+        "aspect_ratio":  aspect_ratio,
+        "direction":     direction,
+        "prompt":        prompt,
+    }
+    return result, meta
 
 
-# ─── Background worker ────────────────────────────────────────────────────────
-def process_job(job_id: str, image: Image.Image, aspect_ratio: str,
-                direction: str, prompt: str, negative_prompt: str):
+# ── Background job worker ─────────────────────────────────────────────────────
+def process_job(job_id, image, aspect_ratio, direction, prompt, negative_prompt):
     try:
         jobs[job_id]["status"] = "processing"
-        result = run_outpainting(image, aspect_ratio, direction, prompt, negative_prompt)
-        out_path = RESULTS_DIR / f"{job_id}.png"
-        result.save(out_path)
-        jobs[job_id]["status"] = "done"
+        result, meta = run_outpainting(image, aspect_ratio, direction, prompt, negative_prompt)
+        path = RESULTS_DIR / f"{job_id}.png"
+        result.save(path)
+        jobs[job_id]["status"]     = "done"
         jobs[job_id]["result_url"] = f"/results/{job_id}.png"
-        print(f"✅ Job {job_id} done → {out_path}")
+        jobs[job_id]["metadata"]   = meta
+        print(f"✅ Job {job_id} done")
     except Exception as e:
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = str(e)
+        jobs[job_id]["error"]  = str(e)
         print(f"❌ Job {job_id} failed: {e}")
 
 
-# ─── Routes ──────────────────────────────────────────────────────────────────
-
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
+        "status":       "ok",
         "model_loaded": pipe is not None,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "device":       "cuda" if torch.cuda.is_available() else "cpu",
         "groq_enabled": bool(GROQ_API_KEY),
     }
 
@@ -285,81 +267,58 @@ def health():
 @app.post("/extend")
 async def extend_image(
     background_tasks: BackgroundTasks,
-    image: UploadFile = File(...),
-    aspect_ratio: str = Form("16:9"),
-    direction: str    = Form("all"),
-    prompt: Optional[str]          = Form(None),
-    negative_prompt: Optional[str] = Form(None),
-    async_mode: bool  = Form(False),   # set True for async job-based response
+    image:           UploadFile      = File(...),
+    aspect_ratio:    str             = Form("16:9"),
+    direction:       str             = Form("all"),
+    prompt:          Optional[str]   = Form(None),
+    negative_prompt: Optional[str]   = Form(None),
+    async_mode:      bool            = Form(False),
 ):
-    """
-    Main endpoint — accepts multipart/form-data.
-    Frontend sends: image file + aspect_ratio + direction + prompt (optional)
-    
-    Sync mode (default):  processes immediately, returns { result_url, job_id, metadata }
-    Async mode:           returns job_id immediately, poll /jobs/{job_id} for status
-    """
     if pipe is None:
-        raise HTTPException(503, "Model not loaded yet, try again in a moment")
+        raise HTTPException(503, "Model not loaded yet, try again shortly")
     if aspect_ratio not in ASPECT_RATIOS:
-        raise HTTPException(400, f"Invalid aspect_ratio. Choose from: {list(ASPECT_RATIOS.keys())}")
+        raise HTTPException(400, f"Invalid aspect_ratio. Valid: {list(ASPECT_RATIOS.keys())}")
 
-    # Read and validate image
     contents = await image.read()
     try:
-        pil_image = Image.open(io.BytesIO(contents)).convert("RGB")
+        pil = Image.open(io.BytesIO(contents)).convert("RGB")
     except Exception:
-        raise HTTPException(400, "Could not read image. Send JPG, PNG, or WEBP.")
+        raise HTTPException(400, "Cannot read image. Send JPG, PNG, or WEBP.")
 
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "pending", "result_url": None, "error": None}
+    jobs[job_id] = {"status": "pending", "result_url": None, "error": None, "metadata": None}
 
     if async_mode:
-        # Fire and forget — frontend polls /jobs/{job_id}
-        background_tasks.add_task(
-            process_job, job_id, pil_image, aspect_ratio, direction, prompt, negative_prompt
-        )
+        background_tasks.add_task(process_job, job_id, pil, aspect_ratio, direction, prompt, negative_prompt)
         return JSONResponse({"job_id": job_id, "status": "pending"})
-    else:
-        # Synchronous — block until done (works for fast GPUs)
-        try:
-            result = run_outpainting(pil_image, aspect_ratio, direction, prompt, negative_prompt)
-            out_path = RESULTS_DIR / f"{job_id}.png"
-            result.save(out_path)
-            jobs[job_id]["status"] = "done"
-            orig_w, orig_h = pil_image.size
-            new_w, new_h, _, _ = compute_expansion(orig_w, orig_h, aspect_ratio, direction)
-            return JSONResponse({
-                "result_url": f"/results/{job_id}.png",
-                "job_id": job_id,
-                "metadata": {
-                    "original_size": [orig_w, orig_h],
-                    "result_size":   [new_w, new_h],
-                    "aspect_ratio":  aspect_ratio,
-                    "direction":     direction,
-                }
-            })
-        except Exception as e:
-            raise HTTPException(500, str(e))
+
+    # Synchronous path
+    try:
+        result, meta = run_outpainting(pil, aspect_ratio, direction, prompt, negative_prompt)
+        path = RESULTS_DIR / f"{job_id}.png"
+        result.save(path)
+        jobs[job_id]["status"]     = "done"
+        jobs[job_id]["result_url"] = f"/results/{job_id}.png"
+        jobs[job_id]["metadata"]   = meta
+        return JSONResponse({
+            "result_url": f"/results/{job_id}.png",
+            "job_id":     job_id,
+            "metadata":   meta,
+        })
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
-    """Poll async job status."""
     if job_id not in jobs:
         raise HTTPException(404, "Job not found")
-    job = jobs[job_id]
-    return {
-        "job_id":     job_id,
-        "status":     job["status"],          # pending | processing | done | failed
-        "result_url": job.get("result_url"),
-        "error":      job.get("error"),
-    }
+    j = jobs[job_id]
+    return {"job_id": job_id, "status": j["status"], "result_url": j.get("result_url"), "error": j.get("error"), "metadata": j.get("metadata")}
 
 
 @app.get("/results/{job_id}.png")
-def get_result(job_id: str):
-    """Serve the result image directly."""
+def serve_result(job_id: str):
     path = RESULTS_DIR / f"{job_id}.png"
     if not path.exists():
         raise HTTPException(404, "Result not found")
